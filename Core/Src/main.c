@@ -26,11 +26,26 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "SEGGER_RTT.h"
+#include "string.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef void (*app_entry_t)(void);
+
+#define OTA_PACKET_MAGIC 0xA55A1234U
+#define OTA_MAX_RETRY   5U
+#define UART_TIMEOUT_MS 3000U
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t packet_id;
+    uint32_t offset;
+    uint16_t data_len;
+    uint16_t header_crc;
+    uint16_t data_crc;
+    uint16_t reserved;
+} ota_packet_header_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -42,7 +57,8 @@ typedef void (*app_entry_t)(void);
 #define APP_START_SECTOR FLASH_SECTOR_1
 #define APP_SECTOR_COUNT 7U   // Sector 1~7
 
-#define OTA_PACKET_SIZE 1024
+#define APP_MAX_SIZE      (896U * 1024U)
+#define OTA_PACKET_SIZE 1024U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -61,33 +77,82 @@ void SystemClock_Config(void);
 static void MPU_Config(void);
 /* USER CODE BEGIN PFP */
 
-static void ota_wait_and_receive_test(void)
+uint16_t crc16_ccitt(const uint8_t *data, size_t len)
 {
-    HAL_StatusTypeDef ret;
+    uint16_t crc = 0xFFFF;
 
-    HAL_UART_Transmit(&huart8, (uint8_t*)"READY\n", 6, 100);
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
 
-    SEGGER_RTT_printf(0, "UART send READY\r\n");
-
-    ret = HAL_UART_Receive(
-        &huart8,
-        ota_rx_buf,
-        1,
-        HAL_MAX_DELAY
-    );
-
-    if (ret == HAL_OK) {
-        SEGGER_RTT_printf(0, "Receive 1024 bytes OK\r\n");
-
-        SEGGER_RTT_printf(
-            0,
-            "first bytes: %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
-            ota_rx_buf[0], ota_rx_buf[1], ota_rx_buf[2], ota_rx_buf[3],
-            ota_rx_buf[4], ota_rx_buf[5], ota_rx_buf[6], ota_rx_buf[7]
-        );
-    } else {
-        SEGGER_RTT_printf(0, "UART receive failed, ret=%d\r\n", ret);
+        for (int j = 0; j < 8; j++) {
+            if (crc & 0x8000)
+                crc = (crc << 1) ^ 0x1021;
+            else
+                crc <<= 1;
+        }
     }
+
+    return crc;
+}
+
+static uint16_t ota_header_crc16(ota_packet_header_t *header)
+{
+    uint16_t old_crc = header->header_crc;
+    header->header_crc = 0;
+
+    uint16_t crc = crc16_ccitt((uint8_t *)header, sizeof(ota_packet_header_t));
+
+    header->header_crc = old_crc;
+    return crc;
+}
+
+uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len)
+{
+    crc = ~crc;
+
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+
+        for (int j = 0; j < 8; j++) {
+            if (crc & 1)
+                crc = (crc >> 1) ^ 0xEDB88320;
+            else
+                crc >>= 1;
+        }
+    }
+
+    return ~crc;
+}
+
+static HAL_StatusTypeDef write_app_flash(uint32_t flash_addr, const uint8_t *data, uint32_t len)
+{
+    HAL_StatusTypeDef status = HAL_OK;
+
+    if ((flash_addr % 32U) != 0U) {
+        return HAL_ERROR;
+    }
+
+    if ((len % 32U) != 0U) {
+        return HAL_ERROR;
+    }
+
+    HAL_FLASH_Unlock();
+
+    for (uint32_t offset = 0; offset < len; offset += 32U) {
+        status = HAL_FLASH_Program(
+            FLASH_TYPEPROGRAM_FLASHWORD,
+            flash_addr + offset,
+            (uint32_t)(data + offset)
+        );
+
+        if (status != HAL_OK) {
+            HAL_FLASH_Lock();
+            return status;
+        }
+    }
+
+    HAL_FLASH_Lock();
+    return HAL_OK;
 }
 
 static HAL_StatusTypeDef erase_app_flash(void)
@@ -118,6 +183,161 @@ static HAL_StatusTypeDef erase_app_flash(void)
     }
 
     SEGGER_RTT_printf(0, "Erase app flash OK\r\n");
+
+    return HAL_OK;
+}
+
+static HAL_StatusTypeDef ota_receive_and_write_app(void)
+{
+    HAL_StatusTypeDef ret;
+    uint32_t fw_size = 0;
+    uint32_t expected_fw_crc32 = 0;
+    uint32_t calc_fw_crc32 = 0;
+    uint32_t received = 0;
+    uint32_t expected_packet_id = 0;
+
+    HAL_UART_Transmit(&huart8, (uint8_t *)"READY\n", 6, 100);
+    SEGGER_RTT_printf(0, "UART send READY\r\n");
+
+    ret = HAL_UART_Receive(&huart8, (uint8_t *)&fw_size, 4, 5000);
+    if (ret != HAL_OK) {
+        SEGGER_RTT_printf(0, "Receive fw_size failed, ret=%d\r\n", ret);
+        return ret;
+    }
+
+    ret = HAL_UART_Receive(&huart8, (uint8_t *)&expected_fw_crc32, 4, 5000);
+    if (ret != HAL_OK) {
+        SEGGER_RTT_printf(0, "Receive fw_crc32 failed, ret=%d\r\n", ret);
+        return ret;
+    }
+
+    SEGGER_RTT_printf(0, "fw_size=%lu, fw_crc32=0x%08lX\r\n",
+                      fw_size, expected_fw_crc32);
+
+    if (fw_size == 0 || fw_size > APP_MAX_SIZE) {
+        HAL_UART_Transmit(&huart8, (uint8_t *)"SIZE_ERR\n", 9, 100);
+        return HAL_ERROR;
+    }
+
+    if (erase_app_flash() != HAL_OK) {
+        HAL_UART_Transmit(&huart8, (uint8_t *)"ERASE_ERR\n", 10, 100);
+        return HAL_ERROR;
+    }
+
+    HAL_UART_Transmit(&huart8, (uint8_t *)"SIZE_OK\n", 8, 100);
+
+    while (received < fw_size) {
+        ota_packet_header_t header;
+        uint8_t packet_ok = 0;
+
+        for (uint32_t retry = 0; retry < OTA_MAX_RETRY; retry++) {
+            memset(&header, 0, sizeof(header));
+            memset(ota_rx_buf, 0xFF, sizeof(ota_rx_buf));
+
+            ret = HAL_UART_Receive(
+                &huart8,
+                (uint8_t *)&header,
+                sizeof(header),
+                UART_TIMEOUT_MS
+            );
+
+            if (ret != HAL_OK) {
+                SEGGER_RTT_printf(0, "Header timeout, retry=%lu\r\n", retry);
+                HAL_UART_Transmit(&huart8, (uint8_t *)"NACK\n", 5, 100);
+                continue;
+            }
+
+            uint16_t calc_header_crc = ota_header_crc16(&header);
+
+            if (header.magic != OTA_PACKET_MAGIC ||
+                header.header_crc != calc_header_crc ||
+                header.packet_id != expected_packet_id ||
+                header.offset != received ||
+                header.data_len == 0 ||
+                header.data_len > OTA_PACKET_SIZE ||
+                header.data_len > (fw_size - received)) {
+
+                SEGGER_RTT_printf(
+                    0,
+                    "Header invalid: magic=0x%08lX id=%lu offset=%lu len=%u hcrc=0x%04X calc=0x%04X\r\n",
+                    header.magic,
+                    header.packet_id,
+                    header.offset,
+                    header.data_len,
+                    header.header_crc,
+                    calc_header_crc
+                );
+
+                HAL_UART_Transmit(&huart8, (uint8_t *)"NACK\n", 5, 100);
+                continue;
+            }
+
+            ret = HAL_UART_Receive(
+                &huart8,
+                ota_rx_buf,
+                header.data_len,
+                UART_TIMEOUT_MS
+            );
+
+            if (ret != HAL_OK) {
+                SEGGER_RTT_printf(0, "Data timeout, retry=%lu\r\n", retry);
+                HAL_UART_Transmit(&huart8, (uint8_t *)"NACK\n", 5, 100);
+                continue;
+            }
+
+            uint16_t calc_data_crc = crc16_ccitt(ota_rx_buf, header.data_len);
+
+            if (calc_data_crc != header.data_crc) {
+                SEGGER_RTT_printf(
+                    0,
+                    "Data CRC error: recv=0x%04X calc=0x%04X\r\n",
+                    header.data_crc,
+                    calc_data_crc
+                );
+
+                HAL_UART_Transmit(&huart8, (uint8_t *)"NACK\n", 5, 100);
+                continue;
+            }
+
+            packet_ok = 1;
+            break;
+        }
+
+        if (!packet_ok) {
+            SEGGER_RTT_printf(0, "Packet failed too many times\r\n");
+            return HAL_ERROR;
+        }
+
+        uint32_t write_len = (header.data_len + 31U) & ~31U;
+
+        if (write_app_flash(APP_ADDR + header.offset, ota_rx_buf, write_len) != HAL_OK) {
+            SEGGER_RTT_printf(0, "Write flash failed at 0x%08lX\r\n",
+                              APP_ADDR + header.offset);
+            HAL_UART_Transmit(&huart8, (uint8_t *)"WRITE_ERR\n", 10, 100);
+            return HAL_ERROR;
+        }
+
+        calc_fw_crc32 = crc32_update(calc_fw_crc32, ota_rx_buf, header.data_len);
+
+        received += header.data_len;
+        expected_packet_id++;
+
+        SEGGER_RTT_printf(0, "packet OK, received=%lu/%lu\r\n", received, fw_size);
+
+        HAL_UART_Transmit(&huart8, (uint8_t *)"ACK\n", 4, 100);
+    }
+
+    SEGGER_RTT_printf(0, "calc_crc32=0x%08lX, expected=0x%08lX\r\n",
+                      calc_fw_crc32,
+                      expected_fw_crc32);
+
+    if (calc_fw_crc32 != expected_fw_crc32) {
+        HAL_UART_Transmit(&huart8, (uint8_t *)"CRC_ERR\n", 8, 100);
+        return HAL_ERROR;
+    }
+
+    HAL_UART_Transmit(&huart8, (uint8_t *)"DONE\n", 5, 100);
+    SEGGER_RTT_printf(0, "OTA receive done\r\n");
 
     return HAL_OK;
 }
@@ -244,55 +464,21 @@ int main(void)
 
         clear_update_flag();
 
-        if (erase_app_flash() != HAL_OK)
-        {
-            SEGGER_RTT_printf(0, "erase app failed\r\n");
-            while (1)
-            {
-                HAL_Delay(1000);
+        if (ota_receive_and_write_app() == HAL_OK) {
+            SEGGER_RTT_printf(0, "OTA write success\r\n");
+
+            if (app_is_valid()) {
+                SEGGER_RTT_printf(0, "Jump to new app\r\n");
+                HAL_Delay(100);
+                jump_to_app();
+            } else {
+                SEGGER_RTT_printf(0, "App invalid after OTA\r\n");
             }
+        } else {
+            SEGGER_RTT_printf(0, "OTA failed\r\n");
         }
 
-        //是否真正擦除
-        uint32_t v0 = *(volatile uint32_t*)APP_ADDR;
-        uint32_t v1 = *(volatile uint32_t*)(APP_ADDR + 4);
-        SEGGER_RTT_printf(0, "app[0]=0x%08X\r\n", v0);
-        SEGGER_RTT_printf(0, "app[1]=0x%08X\r\n", v1);
-
-        // uint32_t test_data[8] = {
-        //     0x24050000,
-        //     0x08035309,
-        //     0x11111111,
-        //     0x22222222,
-        //     0x33333333,
-        //     0x44444444,
-        //     0x55555555,
-        //     0x66666666
-        // };
-        //
-        // HAL_FLASH_Unlock();
-        //
-        // HAL_FLASH_Program(
-        //     FLASH_TYPEPROGRAM_FLASHWORD,
-        //     APP_ADDR,
-        //     (uint32_t)test_data
-        // );
-        // HAL_FLASH_Lock();
-
-        ota_wait_and_receive_test();
-
-        while (1)
-        {
-            SEGGER_RTT_printf(0, "Stay in bootloader, Test Check!\r\n");
-
-            for (int i = 0; i < 8; i++)
-            {
-                SEGGER_RTT_printf(0, "flash[%d]=0x%08X\r\n",
-                                  i,
-                                  *(volatile uint32_t*)(APP_ADDR + i * 4));
-            }
-
-
+        while (1) {
             HAL_Delay(1000);
         }
     }
