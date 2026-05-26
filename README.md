@@ -31,3 +31,9 @@ ESP32
 STM32 BootLoader
   ↓
 STM32 App
+```
+
+## TODO
+
+- [ ] 和ESP32的通讯协议，接受并校验串口发来的二进制文件
+- [ ] 将二进制文件写入FLASH,并且正常跳转到app,退出OTA升级
